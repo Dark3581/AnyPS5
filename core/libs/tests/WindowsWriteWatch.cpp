@@ -583,6 +583,45 @@ void CheckComparedWhenShared() {
     CloseHandle(section);
 }
 
+void CheckArmedWhenSharedBySwitch() {
+    auto& mappings = Mappings::Get();
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+    auto* first = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    auto* second = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(section && first && second, "cannot allocate armed sharing test memory");
+    mappings.ForgetSection(section);
+    const auto collect = [&](unsigned char* address) {
+        std::array<void*, 32> pages{};
+        std::size_t count = pages.size();
+        return mappings.Collect(reinterpret_cast<std::uintptr_t>(address), Bytes, pages.data(), &count, true);
+    };
+    mappings.Map(first, Bytes, section, 0, PAGE_READWRITE, true, true);
+    mappings.CompareWhenShared(reinterpret_cast<std::uintptr_t>(first), Bytes);
+    mappings.CompareWhenShared(reinterpret_cast<std::uintptr_t>(first), Bytes, true);
+    mappings.Map(second, Bytes, section, 0, PAGE_READWRITE, true, true);
+    Require(collect(first) && collect(second), "a page marked to be compared when shared was not collected under APS5_ARM_SHARED_PAGES");
+    std::array<void*, 32> compared{};
+    std::size_t count = compared.size();
+    mappings.ComparedPages(reinterpret_cast<std::uintptr_t>(first), Bytes, compared.data(), &count, false);
+    Require(count == 0, "a page was listed as compared under APS5_ARM_SHARED_PAGES");
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(second, &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READONLY, "a shared page was not armed under APS5_ARM_SHARED_PAGES");
+    const auto before = faults.load();
+    first[8] = 0x6b;
+    Require(faults.load() > before && second[8] == 0x6b, "a store into an armed shared page was not tracked under APS5_ARM_SHARED_PAGES");
+    std::array<void*, 32> pages{};
+    count = pages.size();
+    Require(mappings.Collect(reinterpret_cast<std::uintptr_t>(second), Bytes, pages.data(), &count, true) && count != 0, "a store into an armed shared page was not collected through its other mapping under APS5_ARM_SHARED_PAGES");
+    mappings.Reset(first, Bytes);
+    mappings.Reset(second, Bytes);
+    for (auto* reserved : {first, second}) {
+        VirtualFree(reserved, Bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        VirtualFree(reserved, 0, MEM_RELEASE);
+    }
+    mappings.ForgetSection(section);
+    CloseHandle(section);
+}
+
 void CheckResidentOnlyComparedWhenShared() {
     auto& mappings = Mappings::Get();
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
@@ -1038,6 +1077,12 @@ int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
         Require(handler != nullptr, "cannot install test handler");
+        if (argc > 1 && std::string(argv[1]) == "--arm-shared") {
+            CheckArmedWhenSharedBySwitch();
+            std::cout << "Windows armed shared page tests passed\n";
+            RemoveVectoredExceptionHandler(handler);
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--verify-direct") {
             CheckVerifiedPrivateCollect();
             std::cout << "Windows verified private collect tests passed\n";
